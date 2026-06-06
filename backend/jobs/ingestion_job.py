@@ -1,1 +1,211 @@
-# ingestion_job
+"""
+Ingestion jobs.
+Fetches raw content from all active sources and stores ContentItem records.
+Called by APScheduler (run_ingestion_for_source_type) and by the
+POST /investors/{id}/sync API endpoint (run_ingestion_for_investor).
+"""
+import hashlib
+import uuid
+from datetime import datetime, timezone
+
+import structlog
+
+logger = structlog.get_logger()
+
+
+async def run_ingestion_for_investor(investor_id: str) -> dict:
+    """Trigger ingestion for ALL active sources belonging to one investor."""
+    from database.connection import AsyncSessionLocal
+    from models.source import Source
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as db:
+        sources = (
+            await db.execute(
+                select(Source)
+                .where(Source.investor_id == uuid.UUID(investor_id), Source.is_active.is_(True))
+            )
+        ).scalars().all()
+
+    results = {"investor_id": investor_id, "processed": 0, "failed": 0, "skipped": 0}
+    for source in sources:
+        r = await _ingest_source(source)
+        results["processed"] += r.get("new_items", 0)
+        results["failed"] += 1 if r.get("error") else 0
+        results["skipped"] += r.get("skipped", 0)
+
+    logger.info("Investor ingestion complete", **results)
+    return results
+
+
+async def run_ingestion_for_source_type(source_type: str) -> dict:
+    """Scheduled job: ingest all active sources of a given source_type."""
+    from database.connection import AsyncSessionLocal
+    from models.source import Source
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as db:
+        sources = (
+            await db.execute(
+                select(Source)
+                .where(Source.source_type == source_type, Source.is_active.is_(True))
+            )
+        ).scalars().all()
+
+    results = {"source_type": source_type, "sources": len(sources), "processed": 0, "failed": 0}
+    for source in sources:
+        r = await _ingest_source(source)
+        results["processed"] += r.get("new_items", 0)
+        results["failed"] += 1 if r.get("error") else 0
+
+    logger.info("Source-type ingestion complete", **results)
+    return results
+
+
+async def _ingest_source(source) -> dict:
+    """Fetch documents from a single source and persist new ContentItem records."""
+    from database.connection import AsyncSessionLocal
+    from models.content_item import ContentItem
+    from sqlalchemy import select
+    from ingestion.content_hasher import compute_hash
+
+    source_type = source.source_type
+    source_id = str(source.id)
+    investor_id = str(source.investor_id)
+
+    log = logger.bind(source_id=source_id, source_type=source_type)
+
+    try:
+        docs = await _fetch_documents(source)
+    except Exception as e:
+        log.error("Fetch failed", error=str(e))
+        await _increment_failure(source_id)
+        return {"error": str(e)}
+
+    if not docs:
+        log.info("No new documents")
+        return {"new_items": 0, "skipped": 0}
+
+    new_count = 0
+    skip_count = 0
+
+    async with AsyncSessionLocal() as db:
+        for doc in docs:
+            raw_text = doc.page_content or ""
+            if not raw_text.strip():
+                skip_count += 1
+                continue
+
+            content_hash = compute_hash(raw_text)
+
+            # Duplicate check
+            existing = (
+                await db.execute(
+                    select(ContentItem.id).where(ContentItem.content_hash == content_hash)
+                )
+            ).scalar_one_or_none()
+            if existing:
+                skip_count += 1
+                continue
+
+            content_type = _detect_content_type(source_type, doc.metadata)
+            item = ContentItem(
+                source_id=uuid.UUID(source_id),
+                investor_id=uuid.UUID(investor_id),
+                content_type=content_type,
+                raw_text=raw_text,
+                content_hash=content_hash,
+                processing_status="pending",
+                metadata={
+                    "source_url": doc.metadata.get("source", source.url),
+                    "title": doc.metadata.get("title", ""),
+                    "published_at": doc.metadata.get("published", ""),
+                    **{k: v for k, v in doc.metadata.items() if k not in ("source", "title", "published")},
+                },
+            )
+            db.add(item)
+            new_count += 1
+
+        await db.commit()
+
+    # Reset failure counter on success
+    await _reset_failure(source_id)
+    await _update_last_checked(source_id)
+
+    log.info("Ingestion done", new_items=new_count, skipped=skip_count)
+    return {"new_items": new_count, "skipped": skip_count}
+
+
+async def _fetch_documents(source) -> list:
+    """Dispatch to the correct adapter/loader."""
+    source_type = source.source_type
+
+    if source_type == "sec_13f":
+        from ingestion.sec_adapter import SECAdapter
+        adapter = SECAdapter()
+        return await adapter.fetch(source)
+    elif source_type in ("website", "custom"):
+        from ingestion.loaders import load_website
+        return await load_website(source)
+    elif source_type == "rss":
+        from ingestion.loaders import load_rss
+        return await load_rss(source)
+    elif source_type == "youtube":
+        from ingestion.loaders import load_youtube
+        return await load_youtube(source)
+    else:
+        logger.warning("Unknown source_type, skipping", source_type=source_type)
+        return []
+
+
+def _detect_content_type(source_type: str, metadata: dict) -> str:
+    if source_type == "sec_13f":
+        return "filing"
+    if source_type == "youtube":
+        return "video"
+    if source_type == "rss":
+        return "article"
+    # Website heuristics
+    url = metadata.get("source", "").lower()
+    if url.endswith(".pdf"):
+        return "filing"
+    return "article"
+
+
+async def _increment_failure(source_id: str) -> None:
+    from database.connection import AsyncSessionLocal
+    from models.source import Source
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as db:
+        source = (await db.execute(select(Source).where(Source.id == uuid.UUID(source_id)))).scalar_one_or_none()
+        if source:
+            source.consecutive_failures = (source.consecutive_failures or 0) + 1
+            if source.consecutive_failures >= 5:
+                source.is_active = False
+                logger.warning("Source disabled after 5 consecutive failures", source_id=source_id)
+            await db.commit()
+
+
+async def _reset_failure(source_id: str) -> None:
+    from database.connection import AsyncSessionLocal
+    from models.source import Source
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as db:
+        source = (await db.execute(select(Source).where(Source.id == uuid.UUID(source_id)))).scalar_one_or_none()
+        if source and source.consecutive_failures:
+            source.consecutive_failures = 0
+            await db.commit()
+
+
+async def _update_last_checked(source_id: str) -> None:
+    from database.connection import AsyncSessionLocal
+    from models.source import Source
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as db:
+        source = (await db.execute(select(Source).where(Source.id == uuid.UUID(source_id)))).scalar_one_or_none()
+        if source:
+            source.last_checked_at = datetime.now(timezone.utc)
+            await db.commit()
