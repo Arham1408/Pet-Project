@@ -3,7 +3,7 @@ import { getAccessToken } from './supabase'
 import type {
   Investor, InvestorCreate, InvestorUpdate, InvestorDetail,
   Source, SourceCreate,
-  ContentItem,
+  ContentItem, PortfolioChange,
   Report, ReportDetail,
   AlertListResponse,
   SearchRequest, SearchResponse,
@@ -59,8 +59,8 @@ export const sourcesApi = {
 export const contentApi = {
   list: (investorId: string, params?: { content_type?: string; limit?: number; offset?: number }) =>
     apiClient.get<ContentItem[]>(`/content`, { params: { investor_id: investorId, ...params } }),
-  portfolioChanges: (investorId: string) =>
-    apiClient.get(`/content/portfolio-changes`, { params: { investor_id: investorId } }),
+  portfolioChanges: (investorId: string, params?: { filing_period?: string }) =>
+    apiClient.get<PortfolioChange[]>(`/content/portfolio-changes`, { params: { investor_id: investorId, ...params } }),
 }
 
 // ── Reports ───────────────────────────────────────────────────────────────────

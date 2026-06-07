@@ -1,7 +1,7 @@
 'use client'
 import { motion } from 'framer-motion'
 import Link from 'next/link'
-import { ArrowLeft, Edit, RefreshCw, FileText, Activity, Bell, Loader2 } from 'lucide-react'
+import { ArrowLeft, Edit, RefreshCw, FileText, Activity, Bell, Loader2, TrendingUp, TrendingDown, Minus, Plus, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -15,7 +15,17 @@ import { TimelineFeed } from '@/components/investors/TimelineFeed'
 import { contentApi } from '@/lib/api'
 import { useQuery } from '@tanstack/react-query'
 import { useToast } from '@/hooks/use-toast'
-import { formatRelative, formatDate } from '@/lib/utils'
+import { formatRelative, formatDate, formatCurrency, cn } from '@/lib/utils'
+import type { PortfolioChange } from '@/types/api'
+import { use } from 'react'
+
+const changeConfig: Record<string, { label: string; icon: React.ElementType; color: string }> = {
+  new_position: { label: 'New', icon: Plus, color: 'text-emerald-500 bg-emerald-500/10' },
+  increased: { label: 'Increased', icon: TrendingUp, color: 'text-green-500 bg-green-500/10' },
+  decreased: { label: 'Decreased', icon: TrendingDown, color: 'text-orange-500 bg-orange-500/10' },
+  closed: { label: 'Closed', icon: X, color: 'text-red-500 bg-red-500/10' },
+  unchanged: { label: 'Unchanged', icon: Minus, color: 'text-muted-foreground bg-muted' },
+}
 
 export default function InvestorDetailPage({ params }: { params: { id: string } }) {
   const { id } = params
@@ -28,6 +38,12 @@ export default function InvestorDetailPage({ params }: { params: { id: string } 
   const { data: contentItems, isLoading: loadingContent } = useQuery({
     queryKey: ['content', id],
     queryFn: () => contentApi.list(id, { limit: 20 }).then(r => r.data),
+    enabled: !!id,
+  })
+
+  const { data: portfolioChanges, isLoading: loadingPortfolio } = useQuery({
+    queryKey: ['portfolio', id],
+    queryFn: () => contentApi.portfolioChanges(id).then(r => r.data),
     enabled: !!id,
   })
 
@@ -44,6 +60,13 @@ export default function InvestorDetailPage({ params }: { params: { id: string } 
   }
 
   if (!investor) return <p className="text-muted-foreground">Investor not found</p>
+
+  // Group portfolio changes by filing period
+  const portfolioByPeriod = (portfolioChanges ?? []).reduce<Record<string, PortfolioChange[]>>((acc, pc) => {
+    ; (acc[pc.filing_period] ||= []).push(pc)
+    return acc
+  }, {})
+  const periods = Object.keys(portfolioByPeriod).sort().reverse()
 
   return (
     <div className="space-y-6">
@@ -109,6 +132,7 @@ export default function InvestorDetailPage({ params }: { params: { id: string } 
       <Tabs defaultValue="content">
         <TabsList>
           <TabsTrigger value="content">Content</TabsTrigger>
+          <TabsTrigger value="portfolio">Portfolio</TabsTrigger>
           <TabsTrigger value="sources">Sources</TabsTrigger>
           <TabsTrigger value="reports">Reports</TabsTrigger>
           <TabsTrigger value="alerts">Alerts</TabsTrigger>
@@ -119,6 +143,88 @@ export default function InvestorDetailPage({ params }: { params: { id: string } 
             <CardHeader><CardTitle className="text-base">Content Timeline</CardTitle></CardHeader>
             <CardContent>
               <TimelineFeed items={contentItems ?? []} loading={loadingContent} />
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* Portfolio Tab — 13F Holdings */}
+        <TabsContent value="portfolio">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">13F Portfolio Holdings</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {loadingPortfolio ? (
+                <div className="space-y-3">
+                  {[...Array(5)].map((_, i) => <Skeleton key={i} className="h-10 rounded-lg" />)}
+                </div>
+              ) : periods.length === 0 ? (
+                <div className="text-center py-10">
+                  <TrendingUp className="w-8 h-8 text-muted-foreground mx-auto mb-3 opacity-40" />
+                  <p className="text-sm text-muted-foreground">No 13F portfolio data yet</p>
+                  <p className="text-xs text-muted-foreground/60 mt-1">Portfolio changes appear after SEC 13F filings are processed</p>
+                </div>
+              ) : (
+                <div className="space-y-8">
+                  {periods.map(period => {
+                    const changes = portfolioByPeriod[period]
+                    return (
+                      <div key={period}>
+                        <div className="flex items-center gap-2 mb-4">
+                          <Badge variant="outline" className="text-xs font-mono">{period}</Badge>
+                          <span className="text-xs text-muted-foreground">{changes.length} holdings</span>
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <thead>
+                              <tr className="border-b border-border/50 text-xs text-muted-foreground">
+                                <th className="text-left py-2 pr-4 font-medium">Company</th>
+                                <th className="text-left py-2 pr-4 font-medium">Ticker</th>
+                                <th className="text-right py-2 pr-4 font-medium">Shares</th>
+                                <th className="text-right py-2 pr-4 font-medium">Value</th>
+                                <th className="text-right py-2 pr-4 font-medium">% Port</th>
+                                <th className="text-center py-2 font-medium">Change</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {changes.map((pc) => {
+                                const cfg = changeConfig[pc.change_type] || changeConfig.unchanged
+                                const ChangeIcon = cfg.icon
+                                return (
+                                  <motion.tr
+                                    key={pc.id}
+                                    initial={{ opacity: 0 }}
+                                    animate={{ opacity: 1 }}
+                                    className="border-b border-border/30 hover:bg-accent/30 transition-colors"
+                                  >
+                                    <td className="py-2.5 pr-4 text-foreground font-medium">{pc.company_name ?? '—'}</td>
+                                    <td className="py-2.5 pr-4 font-mono text-xs text-primary">{pc.ticker_symbol}</td>
+                                    <td className="py-2.5 pr-4 text-right tabular-nums text-muted-foreground">
+                                      {pc.shares_current.toLocaleString()}
+                                    </td>
+                                    <td className="py-2.5 pr-4 text-right tabular-nums text-muted-foreground">
+                                      {pc.value_usd != null ? formatCurrency(pc.value_usd * 1000) : '—'}
+                                    </td>
+                                    <td className="py-2.5 pr-4 text-right tabular-nums text-muted-foreground">
+                                      {pc.percent_of_portfolio != null ? `${pc.percent_of_portfolio.toFixed(1)}%` : '—'}
+                                    </td>
+                                    <td className="py-2.5 text-center">
+                                      <span className={cn('inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium', cfg.color)}>
+                                        <ChangeIcon className="w-3 h-3" />
+                                        {cfg.label}
+                                      </span>
+                                    </td>
+                                  </motion.tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </CardContent>
           </Card>
         </TabsContent>
@@ -176,7 +282,14 @@ export default function InvestorDetailPage({ params }: { params: { id: string } 
                         <Badge variant={alert.severity as any} className="text-[10px]">{alert.severity}</Badge>
                       </div>
                       {alert.summary && <p className="text-xs text-muted-foreground mt-0.5 line-clamp-1">{alert.summary}</p>}
-                      <p className="text-xs text-muted-foreground/60 mt-1">{formatRelative(alert.created_at)}</p>
+                      <div className="flex items-center gap-3 mt-1">
+                        <p className="text-xs text-muted-foreground/60">{formatRelative(alert.created_at)}</p>
+                        {alert.report_id && (
+                          <Link href={`/reports/${alert.report_id}`} onClick={(e) => e.stopPropagation()}>
+                            <span className="text-xs text-primary hover:underline">View Report →</span>
+                          </Link>
+                        )}
+                      </div>
                     </div>
                     {!alert.is_read && <div className="w-2 h-2 rounded-full bg-primary mt-2 flex-shrink-0" />}
                   </motion.div>
