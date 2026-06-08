@@ -315,7 +315,13 @@ def _parse_infotable_xml(xml_content: str) -> list[dict]:
                 shares = 0
                 if shares_el is not None:
                     for n in NS_PATTERNS:
-                        s = shares_el.find(f"{n}sshPrnamt") or shares_el.find(f"{n}SshPrnamt")
+                        # NOTE: use explicit `is None` checks, never `a or b`.
+                        # An ElementTree element with no children is falsy, so
+                        # `find(a) or find(b)` discards a valid childless <sshPrnamt>
+                        # and silently yields shares=0.
+                        s = shares_el.find(f"{n}sshPrnamt")
+                        if s is None:
+                            s = shares_el.find(f"{n}SshPrnamt")
                         if s is not None and s.text:
                             try:
                                 shares = int(s.text.strip())

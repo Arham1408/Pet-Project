@@ -59,6 +59,23 @@ async def load_website(source) -> list[Document]:
     if docs and len(docs[0].page_content) >= 200:
         return _enrich(docs, base_meta)
 
+    # Tier 1.5: index-style page (mostly hyperlinks, little text).
+    # Tier 1 returned thin/empty content — the real data likely lives in
+    # linked child pages (e.g. an SEC filing-index that links to infotable.xml).
+    # Follow those links recursively and capture the structured data.
+    if source.config.get("follow_links", True):
+        from ingestion.recursive_loader import load_recursive_links
+
+        link_docs = await load_recursive_links(
+            url,
+            base_meta,
+            max_depth=int(source.config.get("max_depth", 2)),
+            max_pages=int(source.config.get("max_pages", 40)),
+            same_domain=bool(source.config.get("same_domain", True)),
+        )
+        if link_docs:
+            return _enrich(link_docs, base_meta)
+
     # Tier 2: archive / recursive crawl
     docs = await _load_recursive(url, base_meta)
     if docs:
